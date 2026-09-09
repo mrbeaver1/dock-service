@@ -1,0 +1,146 @@
+name: dock-service
+
+services:
+  app:
+    image: ${COMPOSE_PROJECT_NAME:-dock-service}-app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      APP_PORT: ${APP_PORT}
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      JWT_SECRET: ${JWT_SECRET}
+      CACHE_TTL: ${CACHE_TTL:-5m}
+      PASSWORD_MAX_CONCURRENT: ${PASSWORD_MAX_CONCURRENT:-2}
+      AUTH_MAX_CONCURRENT: ${AUTH_MAX_CONCURRENT:-8}
+      AUTH_MAX_BYTES: ${AUTH_MAX_BYTES:-8388608}
+      AUTH_IDLE_TIMEOUT: ${AUTH_IDLE_TIMEOUT:-10s}
+      AUTH_READ_TIMEOUT: ${AUTH_READ_TIMEOUT:-30s}
+      HTTP_WRITE_IDLE_TIMEOUT: ${HTTP_WRITE_IDLE_TIMEOUT:-30s}
+      UPLOAD_MAX_CONCURRENT: ${UPLOAD_MAX_CONCURRENT:-4}
+      UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-1073741824}
+      UPLOAD_IDLE_TIMEOUT: ${UPLOAD_IDLE_TIMEOUT:-30s}
+      UPLOAD_READ_TIMEOUT: ${UPLOAD_READ_TIMEOUT:-30m}
+      UPLOAD_TIMEOUT: ${UPLOAD_TIMEOUT:-30m}
+      UPLOAD_TEMP_DIR: ${UPLOAD_TEMP_DIR:-/tmp/dock-service-uploads}
+      RPS: ${RPS}
+      BURST: ${BURST}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_SSL_MODE: ${POSTGRES_SSL_MODE:-prefer}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      S3_HOST: s3
+      S3_API_PORT: "9000"
+      S3_CONSOLE_PORT: "9001"
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET}
+    ports:
+      - "${HOST_BIND_ADDRESS}:${APP_PORT}:${APP_PORT}"
+    stop_grace_period: 45s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      s3-init:
+        condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+
+  migrate:
+    image: ${COMPOSE_PROJECT_NAME:-dock-service}-app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["/dock-migrate"]
+    command: ["up"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_SSL_MODE: ${POSTGRES_SSL_MODE:-prefer}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  postgres:
+    image: postgres:18.6-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${HOST_BIND_ADDRESS}:${POSTGRES_PORT}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:8.10.1-alpine
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$$REDIS_PASSWORD\""]
+    ports:
+      - "${HOST_BIND_ADDRESS}:${REDIS_PORT}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli --no-auth-warning -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  s3:
+    image: minio/minio:latest
+    container_name: dock-service-s3
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY}
+    ports:
+      - "127.0.0.1:${S3_API_PORT:-9102}:9000"
+      - "127.0.0.1:${S3_CONSOLE_PORT:-9103}:9001"
+    volumes:
+      - s3_data:/data
+    restart: unless-stopped
+
+  s3-init:
+    image: minio/mc:latest
+    container_name: dock-service-s3-init
+    depends_on:
+      s3:
+        condition: service_started
+    environment:
+      S3_ACCESS_KEY: ${S3_ACCESS_KEY}
+      S3_SECRET_KEY: ${S3_SECRET_KEY}
+      S3_BUCKET: ${S3_BUCKET}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        until mc alias set local http://s3:9000 "$${S3_ACCESS_KEY}" "$${S3_SECRET_KEY}" && mc ready local; do
+          sleep 1
+        done
+        mc mb --ignore-existing "local/$${S3_BUCKET}"
+        mc anonymous set download "local/$${S3_BUCKET}"
+    restart: "no"
+
+volumes:
+  postgres_data:
+  redis_data:
+  s3_data:
+    # Reuse the existing volume after renaming the Compose storage service.
+    name: ${COMPOSE_PROJECT_NAME:-dock-service}_minio_data
