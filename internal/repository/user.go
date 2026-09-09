@@ -13,6 +13,7 @@ type UserRepository interface {
 	GetByID(ctx context.Context, id uuid.UUID) (models.User, error)
 	GetByLogin(ctx context.Context, login string) (models.User, error)
 	Create(ctx context.Context, user models.User) (models.User, error)
+	GetIDsByLogins(ctx context.Context, logins []string) (map[string]uuid.UUID, error)
 }
 
 type userRepository struct {
@@ -48,4 +49,22 @@ func (u *userRepository) Create(ctx context.Context, user models.User) (models.U
 	err := u.db.QueryRow(ctx, `INSERT INTO users (id, login, password_hash) VALUES ($1, $2, $3) RETURNING created_at`,
 		user.ID, user.Login, user.PasswordHash).Scan(&user.CreatedAt)
 	return user, queryError("create user", err, models.ErrUserNotFound)
+}
+
+func (u *userRepository) GetIDsByLogins(ctx context.Context, logins []string) (map[string]uuid.UUID, error) {
+	rows, err := u.db.Query(ctx, `SELECT login, id FROM users WHERE login = ANY($1::text[])`, logins)
+	if err != nil {
+		return nil, fmt.Errorf("resolve grant users: %w", err)
+	}
+	defer rows.Close()
+	ids := make(map[string]uuid.UUID, len(logins))
+	for rows.Next() {
+		var login string
+		var id uuid.UUID
+		if err := rows.Scan(&login, &id); err != nil {
+			return nil, err
+		}
+		ids[login] = id
+	}
+	return ids, rows.Err()
 }

@@ -26,7 +26,7 @@ func FormToken(r *http.Request) (string, error) {
 }
 
 func MultipartToken(r *http.Request) (string, error) {
-	if err := r.ParseMultipartForm(0); err != nil {
+	if err := finishBody(r, r.ParseMultipartForm(0)); err != nil {
 		return "", &DecodeError{Field: "multipart", Err: err}
 	}
 	meta := r.MultipartForm.Value["meta"]

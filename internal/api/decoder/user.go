@@ -15,7 +15,7 @@ func formValues(r *http.Request) (url.Values, error) {
 	if err != nil || kind != "application/x-www-form-urlencoded" {
 		return nil, &DecodeError{Field: "form", Err: errors.New("expected application/x-www-form-urlencoded")}
 	}
-	if err := r.ParseForm(); err != nil {
+	if err := finishBody(r, r.ParseForm()); err != nil {
 		return nil, &DecodeError{Field: "form", Err: err}
 	}
 	return r.PostForm, nil

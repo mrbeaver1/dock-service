@@ -22,6 +22,9 @@ type Cache interface {
 	OpenFile(ctx context.Context, document models.Document) (io.ReadCloser, error)
 	CacheFile(ctx context.Context, document models.Document, source io.ReadCloser) io.ReadCloser
 	InvalidateDocument(ctx context.Context, document models.Document) error
+	GetDocumentList(context.Context, models.DocumentCollection, models.DocumentListQuery) ([]models.DocumentListItem, error)
+	SetDocumentList(context.Context, models.DocumentCollection, models.DocumentListQuery, []models.DocumentListItem) error
+	InvalidateDocumentLists(context.Context, models.DocumentCollection) error
 }
 
 type redisCache struct {

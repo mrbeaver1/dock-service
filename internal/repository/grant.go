@@ -28,7 +28,7 @@ func insertGrants(ctx context.Context, tx pgx.Tx, documentID uuid.UUID, userIDs 
 func (r *grantRepository) Replace(ctx context.Context, documentID uuid.UUID, userIDs []uuid.UUID) error {
 	err := pgx.BeginFunc(ctx, r.db, func(tx pgx.Tx) error {
 		var id uuid.UUID
-		if err := tx.QueryRow(ctx, `SELECT id FROM documents WHERE id=$1 FOR UPDATE`, documentID).Scan(&id); err != nil {
+		if err := tx.QueryRow(ctx, `SELECT id FROM documents WHERE id=$1 AND deleted_at IS NULL FOR UPDATE`, documentID).Scan(&id); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM document_grants WHERE document_id=$1`, id); err != nil {

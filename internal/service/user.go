@@ -67,7 +67,7 @@ func (s *userService) Register(ctx context.Context, login, password string) (str
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	hash, err := s.passwords.Hash(password)
+	hash, err := s.passwords.Hash(ctx, password)
 	if err != nil {
 		return "", fmt.Errorf("hash password: %w", err)
 	}
@@ -93,7 +93,7 @@ func (s *userService) Authenticate(ctx context.Context, login, password string) 
 	}
 	user, err := s.repo.GetByLogin(ctx, login)
 	if errors.Is(err, models.ErrUserNotFound) {
-		if _, err := s.passwords.Hash(password); err != nil {
+		if _, err := s.passwords.Hash(ctx, password); err != nil {
 			return "", fmt.Errorf("hash authentication candidate: %w", err)
 		}
 		return "", ErrInvalidCredentials
@@ -101,7 +101,7 @@ func (s *userService) Authenticate(ctx context.Context, login, password string) 
 	if err != nil {
 		return "", fmt.Errorf("find authenticating user: %w", err)
 	}
-	match, err := s.passwords.Verify(user.PasswordHash, password)
+	match, err := s.passwords.Verify(ctx, user.PasswordHash, password)
 	if err != nil {
 		return "", fmt.Errorf("verify password: %w", err)
 	}

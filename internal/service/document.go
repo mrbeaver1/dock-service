@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"mime"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/mrbeaver1/dock-service/internal/models"
@@ -16,12 +17,24 @@ import (
 var ErrForbidden = errors.New("document access denied")
 
 type DocumentRepository interface {
+	GetByID(context.Context, uuid.UUID) (models.Document, error)
 	GetAccess(context.Context, uuid.UUID, uuid.UUID) (models.DocumentAccess, error)
 	GetForRead(context.Context, uuid.UUID, uuid.UUID) (models.Document, bool, error)
+	Create(context.Context, models.Document, []uuid.UUID) (models.Document, error)
+	GetCollection(context.Context, uuid.UUID, *string) (models.DocumentCollection, error)
+	List(context.Context, models.DocumentListQuery) ([]models.DocumentListItem, error)
+	MarkDeleted(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) (models.Document, error)
+	FinishDelete(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) error
+}
+
+type DocumentUsers interface {
+	GetIDsByLogins(context.Context, []string) (map[string]uuid.UUID, error)
 }
 
 type DocumentSource interface {
 	Open(ctx context.Context, key string, offset int64) (io.ReadCloser, int64, error)
+	Put(ctx context.Context, key string, content io.Reader, size int64, contentType string) error
+	Delete(ctx context.Context, key string) error
 }
 
 type DocumentCache interface {
@@ -29,10 +42,17 @@ type DocumentCache interface {
 	SetDocument(ctx context.Context, document models.Document) error
 	OpenFile(ctx context.Context, document models.Document) (io.ReadCloser, error)
 	CacheFile(ctx context.Context, document models.Document, source io.ReadCloser) io.ReadCloser
+	InvalidateDocument(ctx context.Context, document models.Document) error
+	GetDocumentList(context.Context, models.DocumentCollection, models.DocumentListQuery) ([]models.DocumentListItem, error)
+	SetDocumentList(context.Context, models.DocumentCollection, models.DocumentListQuery, []models.DocumentListItem) error
+	InvalidateDocumentLists(context.Context, models.DocumentCollection) error
 }
 
 type DocumentService interface {
 	GetDocument(ctx context.Context, id, userID uuid.UUID, metadataOnly bool) (DocumentContent, error)
+	UploadDocument(context.Context, models.Document, []string, io.Reader) (models.Document, error)
+	GetDocumentsList(context.Context, uuid.UUID, models.DocumentListOptions) ([]models.DocumentListItem, error)
+	DeleteDocument(ctx context.Context, id, userID uuid.UUID) error
 }
 
 type DocumentContent struct {
@@ -47,13 +67,16 @@ type FileContent struct {
 }
 
 type documentService struct {
-	repo  DocumentRepository
-	s3    DocumentSource
-	cache DocumentCache
+	repo          DocumentRepository
+	s3            DocumentSource
+	cache         DocumentCache
+	users         DocumentUsers
+	uploads       UploadRepository
+	uploadTimeout time.Duration
 }
 
-func NewDocumentService(repo DocumentRepository, s3 DocumentSource, cache DocumentCache) DocumentService {
-	return &documentService{repo: repo, s3: s3, cache: cache}
+func NewDocumentService(repo DocumentRepository, s3 DocumentSource, cache DocumentCache, users DocumentUsers, uploads UploadRepository, uploadTimeout time.Duration) DocumentService {
+	return &documentService{repo: repo, s3: s3, cache: cache, users: users, uploads: uploads, uploadTimeout: uploadTimeout}
 }
 
 func (s *documentService) GetDocument(ctx context.Context, id, userID uuid.UUID, metadataOnly bool) (DocumentContent, error) {

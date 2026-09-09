@@ -30,7 +30,12 @@ func (s *jwtIssuer) Issue(userID uuid.UUID) (string, error) {
 		return "", errors.New("token subject is required")
 	}
 	now := time.Now()
+	id, err := uuid.NewV7()
+	if err != nil {
+		return "", fmt.Errorf("generate session ID: %w", err)
+	}
 	claims := jwt.MapClaims{
+		"jti": id.String(),
 		"sub": userID.String(),
 		"iat": now.Unix(),
 		"exp": now.Add(sessionLifetime).Unix(),

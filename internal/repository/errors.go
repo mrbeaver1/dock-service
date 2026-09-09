@@ -17,8 +17,13 @@ func queryError(operation string, err, notFound error) error {
 		return fmt.Errorf("%s: %w", operation, notFound)
 	}
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "23505" {
-		return fmt.Errorf("%s: %w: %w", operation, models.ErrConflict, err)
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "23505":
+			return fmt.Errorf("%s: %w: %w", operation, models.ErrConflict, err)
+		case "22003", "22021", "22P02", "22P05", "23503", "23514":
+			return fmt.Errorf("%s: %w: %w", operation, models.ErrInvalidData, err)
+		}
 	}
 	return fmt.Errorf("%s: %w", operation, err)
 }

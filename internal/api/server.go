@@ -3,11 +3,11 @@ package api
 import (
 	"context"
 	"errors"
-
 	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/mrbeaver1/dock-service/internal/api/decoder"
@@ -24,12 +24,10 @@ type Handler interface {
 }
 
 type DocumentService interface {
-	UploadDocument(ctx context.Context, request dto.CreateDocumentRequest, ownerId string) (dto.CreateDocumentResult, error)
-	GetDocumentsList(ctx context.Context, request dto.GetDocumentsRequest, ownerId string) (dto.GetDocumentsResult, error)
-}
-
-type DocumentReader interface {
 	GetDocument(context.Context, uuid.UUID, uuid.UUID, bool) (service.DocumentContent, error)
+	UploadDocument(context.Context, models.Document, []string, io.Reader) (models.Document, error)
+	GetDocumentsList(context.Context, uuid.UUID, models.DocumentListOptions) ([]models.DocumentListItem, error)
+	DeleteDocument(context.Context, uuid.UUID, uuid.UUID) error
 }
 
 type UploadDocumentRequestValidator interface {
@@ -37,38 +35,41 @@ type UploadDocumentRequestValidator interface {
 }
 
 type handler struct {
-	documentReader                 DocumentReader
 	userService                    UserService
-	authSecret                     []byte
+	sessionService                 SessionService
 	adminToken                     string
 	documentService                DocumentService
 	uploadDocumentRequestValidator UploadDocumentRequestValidator
 	rateLimiter                    *middleware.IPLimiter
+	uploadLimiter                  *middleware.BodyLimiter
+	credentialLimiter              *middleware.BodyLimiter
 }
 
-func NewHandler(documents DocumentReader, users UserService, limiter *middleware.IPLimiter, secret []byte, adminToken string) Handler {
-	return &handler{documentReader: documents, userService: users, rateLimiter: limiter, authSecret: secret,
+func NewHandler(documents DocumentService, users UserService, sessions SessionService, limiter *middleware.IPLimiter, uploads, credentials *middleware.BodyLimiter, adminToken string) Handler {
+	return &handler{documentService: documents, userService: users, sessionService: sessions, rateLimiter: limiter,
+		uploadLimiter:                  uploads,
+		credentialLimiter:              credentials,
 		adminToken:                     adminToken,
 		uploadDocumentRequestValidator: validator.NewCreateDocumentRequestValidator()}
 }
 
 func (h *handler) Routes() http.Handler {
 	mux := http.NewServeMux()
-	mux.Handle("POST /api/register", middleware.AdminAuth(h.adminToken, decoder.FormToken)(http.HandlerFunc(h.register)))
-	mux.HandleFunc("POST /api/auth", h.authenticate)
-	mux.Handle("DELETE /api/auth/{token}", middleware.Auth(h.authSecret, decoder.PathToken)(http.HandlerFunc(notImplemented)))
+	mux.Handle("POST /api/register", h.credentialLimiter.Wrap(middleware.AdminAuth(h.adminToken, decoder.FormToken)(http.HandlerFunc(h.register))))
+	mux.Handle("POST /api/auth", h.credentialLimiter.Wrap(http.HandlerFunc(h.authenticate)))
+	mux.Handle("DELETE /api/auth/{token}", middleware.Auth(h.sessionService, decoder.PathToken)(http.HandlerFunc(h.logout)))
 
 	mux.Handle(
 		"GET /api/docs",
-		middleware.Auth(h.authSecret, decoder.QueryToken)(http.HandlerFunc(h.getDocuments)),
+		middleware.Auth(h.sessionService, decoder.QueryToken)(http.HandlerFunc(h.getDocuments)),
 	)
 
-	mux.Handle("POST /api/docs", middleware.Auth(h.authSecret, decoder.MultipartToken)(http.HandlerFunc(h.uploadDocument)))
-	mux.Handle("DELETE /api/docs/{id}", middleware.Auth(h.authSecret, decoder.QueryToken)(http.HandlerFunc(notImplemented)))
+	mux.Handle("POST /api/docs", h.uploadLimiter.Wrap(middleware.Auth(h.sessionService, decoder.MultipartToken)(http.HandlerFunc(h.uploadDocument))))
+	mux.Handle("DELETE /api/docs/{id}", middleware.Auth(h.sessionService, decoder.QueryToken)(http.HandlerFunc(h.deleteDocument)))
 
 	mux.Handle(
 		"GET /api/docs/{id}",
-		middleware.Auth(h.authSecret, decoder.QueryToken)(http.HandlerFunc(h.getDocument)),
+		middleware.Auth(h.sessionService, decoder.QueryToken)(http.HandlerFunc(h.getDocument)),
 	)
 
 	mux.HandleFunc("/api/docs", func(w http.ResponseWriter, r *http.Request) {
@@ -83,20 +84,16 @@ func (h *handler) Routes() http.Handler {
 		response.Fail(w, r, http.StatusNotFound, http.StatusNotFound, http.StatusText(http.StatusNotFound))
 	})
 
-	return middleware.Recovery(
+	return middleware.CloseRequestBody(middleware.Recovery(
 		middleware.RequestID(
 			middleware.Logger(
 				middleware.RateLimit(h.rateLimiter)(mux),
 			),
 		),
-	)
+	))
 }
 
 func (h *handler) getDocuments(w http.ResponseWriter, r *http.Request) {
-	if h.documentService == nil {
-		response.Fail(w, r, 501, 501, "not implemented")
-		return
-	}
 	reqDto, err := decoder.GetListRequestToDto(r)
 
 	if err != nil {
@@ -104,23 +101,24 @@ func (h *handler) getDocuments(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ownerId := middleware.UserIDFromContext(r.Context())
-
-	resp, err := h.documentService.GetDocumentsList(r.Context(), reqDto, ownerId.String())
+	documents, err := h.documentService.GetDocumentsList(r.Context(), middleware.UserIDFromContext(r.Context()), reqDto)
 
 	if err != nil {
 		writeDocumentError(w, r, err)
 		return
 	}
 
+	resp := dto.GetDocumentsResult{Docs: make([]dto.DocumentListItem, 0, len(documents))}
+	for _, document := range documents {
+		resp.Docs = append(resp.Docs, dto.DocumentListItem{
+			ID: document.ID, Name: document.Name, MIME: document.MIME, File: document.File,
+			Public: document.Public, Created: document.CreatedAt.UTC().Format(time.DateTime), Grant: document.Grant,
+		})
+	}
 	response.Success(w, r, nil, resp)
 }
 
 func (h *handler) uploadDocument(w http.ResponseWriter, r *http.Request) {
-	if h.documentService == nil {
-		response.Fail(w, r, 501, 501, "not implemented")
-		return
-	}
 	reqDto, closeFile, err := decoder.UploadRequestToDto(r)
 
 	if closeFile != nil {
@@ -143,15 +141,30 @@ func (h *handler) uploadDocument(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ownerId := middleware.UserIDFromContext(r.Context())
-
-	resp, err := h.documentService.UploadDocument(r.Context(), reqDto, ownerId.String())
+	document := models.Document{
+		OwnerID: middleware.UserIDFromContext(r.Context()), Name: reqDto.Meta.Name,
+		File: reqDto.Meta.File, Public: reqDto.Meta.Public, MIME: reqDto.Meta.MIME, JSON: reqDto.JSON,
+	}
+	var content io.Reader
+	if reqDto.File != nil {
+		document.FileSize = &reqDto.File.Size
+		content = reqDto.File.Content
+	}
+	saved, err := h.documentService.UploadDocument(r.Context(), document, reqDto.Meta.Grant, content)
 
 	if err != nil {
 		writeDocumentError(w, r, err)
 		return
 	}
 
+	resp := dto.CreateDocumentResult{JSON: saved.JSON}
+	if reqDto.File != nil {
+		resp.File = &reqDto.File.Filename
+	}
+	if resp.JSON == nil && resp.File == nil {
+		response.Success(w, r, nil, nil)
+		return
+	}
 	response.Success(w, r, nil, resp)
 }
 
@@ -161,7 +174,7 @@ func (h *handler) getDocument(w http.ResponseWriter, r *http.Request) {
 		writeDocumentError(w, r, err)
 		return
 	}
-	result, err := h.documentReader.GetDocument(r.Context(), id, middleware.UserIDFromContext(r.Context()), r.Method == http.MethodHead)
+	result, err := h.documentService.GetDocument(r.Context(), id, middleware.UserIDFromContext(r.Context()), r.Method == http.MethodHead)
 	if err != nil {
 		writeDocumentError(w, r, err)
 		return
@@ -204,11 +217,24 @@ func methodNotAllowed(allow string) http.HandlerFunc {
 	}
 }
 
-func notImplemented(w http.ResponseWriter, r *http.Request) {
-	response.Fail(w, r, 501, 501, "not implemented")
-}
-
 func writeDocumentError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, models.ErrUploadExpired) {
+		w.Header().Set("Retry-After", "1")
+		response.Fail(w, r, 503, 503, "upload expired; retry the request")
+		return
+	}
+	if errors.Is(err, service.ErrInvalidDocument) || errors.Is(err, service.ErrInvalidListOptions) {
+		response.Fail(w, r, 400, 400, err.Error())
+		return
+	}
+	if errors.Is(err, models.ErrInvalidData) {
+		response.Fail(w, r, 400, 400, "invalid document data")
+		return
+	}
+	if errors.Is(err, models.ErrUserNotFound) {
+		response.Fail(w, r, 404, 404, "user not found")
+		return
+	}
 	if errors.Is(err, models.ErrDocumentNotFound) {
 		response.Fail(w, r, 404, 404, "document not found")
 		return

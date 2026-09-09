@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 
 	"github.com/google/uuid"
@@ -63,23 +64,29 @@ func UploadRequestToDto(r *http.Request) (req dto.CreateDocumentRequest, closeFi
 }
 
 func GetListRequestToDto(r *http.Request) (req dto.GetDocumentsRequest, err error) {
-	query := r.URL.Query()
-
-	login := query.Get("login")
-	key := query.Get("key")
-	value := query.Get("value")
-	limit := query.Get("limit")
-
-	req.Login = &login
-	req.Key = &key
-	req.Value = &value
-	limitInt, err := strconv.ParseUint(limit, 10, 64)
-
+	query, err := url.ParseQuery(r.URL.RawQuery)
 	if err != nil {
-		return req, err
+		return req, &DecodeError{Field: "query", Err: err}
 	}
-
-	req.Limit = &limitInt
-
+	for field, target := range map[string]**string{"login": &req.Login, "key": &req.Key, "value": &req.Value} {
+		values, ok := query[field]
+		if !ok {
+			continue
+		}
+		if len(values) != 1 {
+			return req, &DecodeError{Field: field, Err: fmt.Errorf("must be provided once")}
+		}
+		*target = &values[0]
+	}
+	if values, ok := query["limit"]; ok {
+		if len(values) != 1 {
+			return req, &DecodeError{Field: "limit", Err: fmt.Errorf("must be provided once")}
+		}
+		limit, err := strconv.ParseUint(values[0], 10, 64)
+		if err != nil {
+			return req, &DecodeError{Field: "limit", Err: fmt.Errorf("must be an unsigned integer")}
+		}
+		req.Limit = &limit
+	}
 	return req, nil
 }

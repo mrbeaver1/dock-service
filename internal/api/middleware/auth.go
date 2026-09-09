@@ -8,35 +8,36 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
 	"github.com/mrbeaver1/dock-service/internal/api/response"
+	"github.com/mrbeaver1/dock-service/internal/models"
+	"github.com/mrbeaver1/dock-service/internal/service"
 )
 
-type userIDKeyType string
+type sessionKeyType string
 
-const userIDKey userIDKeyType = "user_id"
+const sessionKey sessionKeyType = "session"
 
 type TokenSource func(*http.Request) (string, error)
 
-func Auth(secret []byte, source TokenSource) func(http.Handler) http.Handler {
+type SessionValidator interface {
+	Validate(context.Context, string) (models.Session, error)
+}
+
+func Auth(sessions SessionValidator, source TokenSource) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return withToken(source, func(w http.ResponseWriter, r *http.Request, tokenStr string) {
-			claims := &jwt.RegisteredClaims{}
-			token, err := jwt.ParseWithClaims(tokenStr, claims, func(_ *jwt.Token) (any, error) {
-				return secret, nil
-			}, jwt.WithValidMethods([]string{jwt.SigningMethodHS256.Alg()}))
-			if err != nil || !token.Valid {
+			session, err := sessions.Validate(r.Context(), tokenStr)
+			if errors.Is(err, service.ErrInvalidSession) {
 				response.Fail(w, r, http.StatusUnauthorized, http.StatusUnauthorized, "invalid token")
 				return
 			}
-
-			userID, err := uuid.Parse(claims.Subject)
-			if err != nil || userID == uuid.Nil {
-				response.Fail(w, r, 401, 401, "invalid token subject")
+			if err != nil {
+				slog.ErrorContext(r.Context(), "validate session", "error", err)
+				response.Fail(w, r, 500, 500, "internal server error")
 				return
 			}
-			ctx := context.WithValue(r.Context(), userIDKey, userID)
+			ctx := context.WithValue(r.Context(), sessionKey, session)
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
@@ -65,6 +66,9 @@ func withToken(source TokenSource, next func(http.ResponseWriter, *http.Request,
 		}()
 		token, err := source(r)
 		if err != nil {
+			if WriteBodyError(w, r, err) {
+				return
+			}
 			var pathErr *os.PathError
 			if errors.As(err, &pathErr) {
 				slog.ErrorContext(r.Context(), "read authentication form", "error", err)
@@ -83,5 +87,9 @@ func withToken(source TokenSource, next func(http.ResponseWriter, *http.Request,
 }
 
 func UserIDFromContext(ctx context.Context) uuid.UUID {
-	return ctx.Value(userIDKey).(uuid.UUID)
+	return SessionFromContext(ctx).UserID
+}
+
+func SessionFromContext(ctx context.Context) models.Session {
+	return ctx.Value(sessionKey).(models.Session)
 }

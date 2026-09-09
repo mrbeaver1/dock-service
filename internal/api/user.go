@@ -8,13 +8,29 @@ import (
 
 	"github.com/mrbeaver1/dock-service/internal/api/decoder"
 	"github.com/mrbeaver1/dock-service/internal/api/dto"
+	"github.com/mrbeaver1/dock-service/internal/api/middleware"
 	"github.com/mrbeaver1/dock-service/internal/api/response"
+	"github.com/mrbeaver1/dock-service/internal/models"
 	"github.com/mrbeaver1/dock-service/internal/service"
 )
 
 type UserService interface {
 	Register(ctx context.Context, login, password string) (string, error)
 	Authenticate(ctx context.Context, login, password string) (string, error)
+}
+
+type SessionService interface {
+	Validate(context.Context, string) (models.Session, error)
+	Revoke(context.Context, models.Session) error
+}
+
+func (h *handler) logout(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	if err := h.sessionService.Revoke(r.Context(), middleware.SessionFromContext(r.Context())); err != nil {
+		writeUserError(w, r, err)
+		return
+	}
+	response.Success(w, r, map[string]bool{r.PathValue("token"): true}, nil)
 }
 
 func (h *handler) register(w http.ResponseWriter, r *http.Request) {
@@ -48,6 +64,14 @@ func (h *handler) authenticate(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeUserError(w http.ResponseWriter, r *http.Request, err error) {
+	if middleware.WriteBodyError(w, r, err) {
+		return
+	}
+	if errors.Is(err, service.ErrBusy) {
+		w.Header().Set("Retry-After", "1")
+		response.Fail(w, r, 503, 503, "authentication capacity exhausted")
+		return
+	}
 	var decodeErr *decoder.DecodeError
 	if errors.As(err, &decodeErr) {
 		response.Fail(w, r, 400, 400, decodeErr.Error())

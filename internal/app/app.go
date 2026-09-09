@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"sync"
 	"time"
+
+	"github.com/mrbeaver1/dock-service/internal/api/middleware"
 )
 
 type App struct {
@@ -28,14 +30,14 @@ func New(ctx context.Context) (*App, error) {
 		return nil, errors.Join(fmt.Errorf("initialize HTTP handler: %w", err), di.Close())
 	}
 	a := &App{diContainer: di}
-	a.httpServer = newHTTPServer(ctx, net.JoinHostPort("", strconv.Itoa(int(di.Cnf().HTTPPort))), a.requests.wrap(handler))
+	a.httpServer = newHTTPServer(ctx, net.JoinHostPort("", strconv.Itoa(int(di.Cnf().HTTPPort))), a.requests.wrap(handler), di.Cnf().WriteIdleTimeout)
 	return a, nil
 }
 
-func newHTTPServer(ctx context.Context, address string, handler http.Handler) *http.Server {
+func newHTTPServer(ctx context.Context, address string, handler http.Handler, writeIdleTimeout time.Duration) *http.Server {
 	return &http.Server{
 		Addr:              address,
-		Handler:           handler,
+		Handler:           middleware.WriteTimeout(writeIdleTimeout)(handler),
 		BaseContext:       func(net.Listener) context.Context { return context.WithoutCancel(ctx) },
 		ReadHeaderTimeout: 5 * time.Second,
 		IdleTimeout:       time.Minute,
@@ -43,6 +45,15 @@ func newHTTPServer(ctx context.Context, address string, handler http.Handler) *h
 }
 
 func (a *App) Run(ctx context.Context) error {
+	deletions, err := a.diContainer.DeletionCleanupService()
+	if err != nil {
+		return err
+	}
+	workerCtx, stopWorker := context.WithCancel(ctx)
+	var workers sync.WaitGroup
+	workers.Go(func() { a.diContainer.UploadCleanupService().Run(workerCtx) })
+	workers.Go(func() { deletions.Run(workerCtx) })
+	defer func() { stopWorker(); workers.Wait() }()
 	errCh := make(chan error, 1)
 	go func() { errCh <- a.httpServer.ListenAndServe() }()
 	select {

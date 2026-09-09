@@ -2,6 +2,7 @@ name: dock-service
 
 services:
   app:
+    image: ${COMPOSE_PROJECT_NAME:-dock-service}-app
     build:
       context: .
       dockerfile: Dockerfile
@@ -10,6 +11,18 @@ services:
       ADMIN_TOKEN: ${ADMIN_TOKEN}
       JWT_SECRET: ${JWT_SECRET}
       CACHE_TTL: ${CACHE_TTL:-5m}
+      PASSWORD_MAX_CONCURRENT: ${PASSWORD_MAX_CONCURRENT:-2}
+      AUTH_MAX_CONCURRENT: ${AUTH_MAX_CONCURRENT:-8}
+      AUTH_MAX_BYTES: ${AUTH_MAX_BYTES:-8388608}
+      AUTH_IDLE_TIMEOUT: ${AUTH_IDLE_TIMEOUT:-10s}
+      AUTH_READ_TIMEOUT: ${AUTH_READ_TIMEOUT:-30s}
+      HTTP_WRITE_IDLE_TIMEOUT: ${HTTP_WRITE_IDLE_TIMEOUT:-30s}
+      UPLOAD_MAX_CONCURRENT: ${UPLOAD_MAX_CONCURRENT:-4}
+      UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-1073741824}
+      UPLOAD_IDLE_TIMEOUT: ${UPLOAD_IDLE_TIMEOUT:-30s}
+      UPLOAD_READ_TIMEOUT: ${UPLOAD_READ_TIMEOUT:-30m}
+      UPLOAD_TIMEOUT: ${UPLOAD_TIMEOUT:-30m}
+      UPLOAD_TEMP_DIR: ${UPLOAD_TEMP_DIR:-/tmp/dock-service-uploads}
       RPS: ${RPS}
       BURST: ${BURST}
       POSTGRES_HOST: postgres
@@ -29,6 +42,7 @@ services:
       S3_BUCKET: ${S3_BUCKET}
     ports:
       - "${HOST_BIND_ADDRESS}:${APP_PORT}:${APP_PORT}"
+    stop_grace_period: 45s
     depends_on:
       postgres:
         condition: service_healthy
@@ -36,6 +50,27 @@ services:
         condition: service_healthy
       s3-init:
         condition: service_completed_successfully
+      migrate:
+        condition: service_completed_successfully
+
+  migrate:
+    image: ${COMPOSE_PROJECT_NAME:-dock-service}-app
+    build:
+      context: .
+      dockerfile: Dockerfile
+    entrypoint: ["/dock-migrate"]
+    command: ["up"]
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_SSL_MODE: ${POSTGRES_SSL_MODE:-prefer}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
 
   postgres:
     image: postgres:18.6-alpine

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"crypto/rand"
 	"crypto/subtle"
 	"encoding/base64"
@@ -12,9 +13,11 @@ import (
 )
 
 type PasswordHasher interface {
-	Hash(password string) (string, error)
-	Verify(encoded, password string) (bool, error)
+	Hash(context.Context, string) (string, error)
+	Verify(context.Context, string, string) (bool, error)
 }
+
+var ErrBusy = errors.New("service capacity exhausted")
 
 const (
 	passwordMemory      = 19 * 1024
@@ -27,11 +30,47 @@ const (
 var passwordHashPrefix = fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$",
 	argon2.Version, passwordMemory, passwordIterations, passwordParallelism)
 
-type passwordHasher struct{}
+type passwordHasher struct {
+	slots     chan struct{}
+	admission chan struct{}
+}
 
-func NewPasswordHasher() PasswordHasher { return &passwordHasher{} }
+func NewPasswordHasher(concurrent int) (PasswordHasher, error) {
+	if concurrent < 1 || concurrent > int(^uint(0)>>1)/8 {
+		return nil, errors.New("password concurrency must be positive")
+	}
+	return &passwordHasher{slots: make(chan struct{}, concurrent), admission: make(chan struct{}, concurrent*8)}, nil
+}
 
-func (h *passwordHasher) Hash(password string) (string, error) {
+func (h *passwordHasher) acquire(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case h.admission <- struct{}{}:
+	default:
+		return ErrBusy
+	}
+	select {
+	case h.slots <- struct{}{}:
+		if err := ctx.Err(); err != nil {
+			h.release()
+			return err
+		}
+		return nil
+	case <-ctx.Done():
+		<-h.admission
+		return ctx.Err()
+	}
+}
+
+func (h *passwordHasher) release() { <-h.slots; <-h.admission }
+
+func (h *passwordHasher) Hash(ctx context.Context, password string) (string, error) {
+	if err := h.acquire(ctx); err != nil {
+		return "", err
+	}
+	defer h.release()
 	salt := make([]byte, passwordSaltSize)
 	if _, err := rand.Read(salt); err != nil {
 		return "", fmt.Errorf("generate password salt: %w", err)
@@ -40,7 +79,11 @@ func (h *passwordHasher) Hash(password string) (string, error) {
 	return passwordHashPrefix + base64.RawStdEncoding.EncodeToString(salt) + "$" + base64.RawStdEncoding.EncodeToString(key), nil
 }
 
-func (h *passwordHasher) Verify(encoded, password string) (bool, error) {
+func (h *passwordHasher) Verify(ctx context.Context, encoded, password string) (bool, error) {
+	if err := h.acquire(ctx); err != nil {
+		return false, err
+	}
+	defer h.release()
 	data, ok := strings.CutPrefix(encoded, passwordHashPrefix)
 	if !ok {
 		return false, errors.New("unsupported password hash format")

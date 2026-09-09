@@ -2,10 +2,12 @@ package repository
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mrbeaver1/dock-service/internal/models"
 )
@@ -17,7 +19,11 @@ type DocumentRepository interface {
 	Create(ctx context.Context, doc models.Document, userIDs []uuid.UUID) (models.Document, error)
 	Update(ctx context.Context, doc models.Document, userIDs []uuid.UUID) (models.Document, error)
 	Delete(ctx context.Context, id uuid.UUID) error
+	MarkDeleted(ctx context.Context, id, ownerID, generation uuid.UUID) (models.Document, error)
+	FinishDelete(ctx context.Context, id, ownerID, generation uuid.UUID) error
 	ListByOwner(ctx context.Context, ownerID uuid.UUID, limit *uint64) ([]models.Document, error)
+	GetCollection(ctx context.Context, ownerID uuid.UUID, login *string) (models.DocumentCollection, error)
+	List(ctx context.Context, query models.DocumentListQuery) ([]models.DocumentListItem, error)
 }
 
 type documentRepository struct{ db *pgxpool.Pool }
@@ -25,7 +31,7 @@ type documentRepository struct{ db *pgxpool.Pool }
 func NewDocumentRepository(db *pgxpool.Pool) DocumentRepository { return &documentRepository{db: db} }
 
 const documentColumns = `d.id, d.generation, d.owner_id, d.name, d.file, d.public, d.mime,
-    d.json_data, d.object_key, d.file_size, d.version, d.created_at, d.updated_at`
+    d.json_data, d.object_key, d.file_size, d.version, d.created_at, d.updated_at, d.deleted_at`
 
 const documentAllowed = `(d.owner_id = $2 OR COALESCE(d.public, false) OR EXISTS (
     SELECT 1 FROM document_grants g WHERE g.document_id = d.id AND g.user_id = $2
@@ -33,7 +39,7 @@ const documentAllowed = `(d.owner_id = $2 OR COALESCE(d.public, false) OR EXISTS
 
 func documentTargets(d *models.Document) []any {
 	return []any{&d.ID, &d.Generation, &d.OwnerID, &d.Name, &d.File, &d.Public, &d.MIME,
-		&d.JSON, &d.ObjectKey, &d.FileSize, &d.Version, &d.CreatedAt, &d.UpdatedAt}
+		&d.JSON, &d.ObjectKey, &d.FileSize, &d.Version, &d.CreatedAt, &d.UpdatedAt, &d.DeletedAt}
 }
 
 func (r *documentRepository) GetByID(ctx context.Context, id uuid.UUID) (models.Document, error) {
@@ -44,7 +50,7 @@ func (r *documentRepository) GetByID(ctx context.Context, id uuid.UUID) (models.
 
 func (r *documentRepository) GetAccess(ctx context.Context, id, userID uuid.UUID) (models.DocumentAccess, error) {
 	var access models.DocumentAccess
-	err := r.db.QueryRow(ctx, `SELECT d.generation, d.version, `+documentAllowed+` FROM documents d WHERE d.id = $1`, id, userID).
+	err := r.db.QueryRow(ctx, `SELECT d.generation, d.version, `+documentAllowed+` FROM documents d WHERE d.id = $1 AND d.deleted_at IS NULL`, id, userID).
 		Scan(&access.Generation, &access.Version, &access.Allowed)
 	return access, queryError("get document access", err, models.ErrDocumentNotFound)
 }
@@ -53,7 +59,7 @@ func (r *documentRepository) GetForRead(ctx context.Context, id, userID uuid.UUI
 	var doc models.Document
 	var allowed bool
 	targets := append(documentTargets(&doc), &allowed)
-	err := r.db.QueryRow(ctx, `SELECT `+documentColumns+`, `+documentAllowed+` FROM documents d WHERE d.id = $1`, id, userID).Scan(targets...)
+	err := r.db.QueryRow(ctx, `SELECT `+documentColumns+`, `+documentAllowed+` FROM documents d WHERE d.id = $1 AND d.deleted_at IS NULL`, id, userID).Scan(targets...)
 	return doc, allowed, queryError("read document", err, models.ErrDocumentNotFound)
 }
 
@@ -65,7 +71,15 @@ func (r *documentRepository) Create(ctx context.Context, doc models.Document, us
 		}
 		doc.ID = id
 	}
+	readyToCommit := false
 	err := pgx.BeginFunc(ctx, r.db, func(tx pgx.Tx) error {
+		if doc.ObjectKey != nil {
+			var id uuid.UUID
+			if err := tx.QueryRow(ctx, `SELECT id FROM upload_jobs WHERE id=$1 AND owner_id=$2
+			    AND object_key=$3 AND cleanup_token IS NULL FOR UPDATE`, doc.ID, doc.OwnerID, *doc.ObjectKey).Scan(&id); err != nil {
+				return queryError("lock upload", err, models.ErrUploadExpired)
+			}
+		}
 		_, err := tx.Exec(ctx, `INSERT INTO documents
 		    (id, owner_id, name, file, public, mime, json_data, object_key, file_size)
 		    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`, doc.ID, doc.OwnerID, doc.Name, doc.File,
@@ -76,15 +90,26 @@ func (r *documentRepository) Create(ctx context.Context, doc models.Document, us
 		if err := insertGrants(ctx, tx, doc.ID, userIDs); err != nil {
 			return err
 		}
-		return tx.QueryRow(ctx, `SELECT `+documentColumns+` FROM documents d WHERE d.id=$1`, doc.ID).Scan(documentTargets(&doc)...)
+		if doc.ObjectKey != nil {
+			if _, err := tx.Exec(ctx, `DELETE FROM upload_jobs WHERE id=$1`, doc.ID); err != nil {
+				return err
+			}
+		}
+		err = tx.QueryRow(ctx, `SELECT `+documentColumns+` FROM documents d WHERE d.id=$1`, doc.ID).Scan(documentTargets(&doc)...)
+		readyToCommit = err == nil
+		return err
 	})
+	commitNotSent := pgconn.SafeToRetry(err) && !errors.Is(err, pgconn.ErrConnClosed)
+	if err != nil && readyToCommit && !errors.Is(err, pgx.ErrTxCommitRollback) && !commitNotSent {
+		return doc, fmt.Errorf("create document: %w: %w", models.ErrCommitUnknown, err)
+	}
 	return doc, queryError("create document", err, models.ErrDocumentNotFound)
 }
 
 func (r *documentRepository) Update(ctx context.Context, doc models.Document, userIDs []uuid.UUID) (models.Document, error) {
 	err := pgx.BeginFunc(ctx, r.db, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `UPDATE documents SET name=$2, file=$3, public=$4, mime=$5,
-		    json_data=$6, object_key=$7, file_size=$8 WHERE id=$1`, doc.ID, doc.Name, doc.File,
+		    json_data=$6, object_key=$7, file_size=$8 WHERE id=$1 AND deleted_at IS NULL`, doc.ID, doc.Name, doc.File,
 			doc.Public, doc.MIME, doc.JSON, doc.ObjectKey, doc.FileSize)
 		if err != nil {
 			return err
@@ -115,7 +140,7 @@ func (r *documentRepository) Delete(ctx context.Context, id uuid.UUID) error {
 }
 
 func (r *documentRepository) ListByOwner(ctx context.Context, ownerID uuid.UUID, limit *uint64) ([]models.Document, error) {
-	query := `SELECT ` + documentColumns + ` FROM documents d WHERE d.owner_id=$1 ORDER BY d.name, d.created_at, d.id`
+	query := `SELECT ` + documentColumns + ` FROM documents d WHERE d.owner_id=$1 AND d.deleted_at IS NULL ORDER BY d.name, d.created_at, d.id`
 	args := []any{ownerID}
 	if limit != nil {
 		if *limit <= uint64(1<<63-1) {

@@ -3,6 +3,9 @@ package dto
 import (
 	"encoding/json"
 	"io"
+
+	"github.com/google/uuid"
+	"github.com/mrbeaver1/dock-service/internal/models"
 )
 
 type CreateDocumentRequest struct {
@@ -30,13 +33,18 @@ type CreateDocumentResult struct {
 	File *string         `json:"file,omitempty"`
 }
 
-type GetDocumentsRequest struct {
-	Login *string
-	Key   *string
-	Value *string
-	Limit *uint64
-}
+type GetDocumentsRequest = models.DocumentListOptions
 
 type GetDocumentsResult struct {
-	Docs []json.RawMessage `json:"docs,omitempty"`
+	Docs []DocumentListItem `json:"docs"`
+}
+
+type DocumentListItem struct {
+	ID      uuid.UUID `json:"id"`
+	Name    *string   `json:"name"`
+	MIME    *string   `json:"mime"`
+	File    *bool     `json:"file"`
+	Public  *bool     `json:"public"`
+	Created string    `json:"created"`
+	Grant   []string  `json:"grant"`
 }

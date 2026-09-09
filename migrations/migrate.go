@@ -14,7 +14,20 @@ import (
 //go:embed *.sql
 var scripts embed.FS
 
-var names = [...]string{"documents", "document_generation"}
+var names = [...]string{"documents", "document_generation", "document_collections", "deletion_and_sessions", "upload_recovery", "deletion_recovery", "document_json"}
+
+func Check(ctx context.Context, pool *pgxpool.Pool) error {
+	return pgx.BeginTxFunc(ctx, pool, pgx.TxOptions{AccessMode: pgx.ReadOnly}, func(tx pgx.Tx) error {
+		count, err := applied(ctx, tx)
+		if err != nil {
+			return fmt.Errorf("check database schema; apply migrations before starting: %w", err)
+		}
+		if count != len(names) {
+			return fmt.Errorf("database schema is at version %d; version %d is required", count, len(names))
+		}
+		return nil
+	})
+}
 
 func script(version int, direction string) ([]byte, error) {
 	return scripts.ReadFile(fmt.Sprintf("%06d_%s.%s.sql", version, names[version-1], direction))
