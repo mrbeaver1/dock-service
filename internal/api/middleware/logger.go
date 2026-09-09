@@ -3,6 +3,7 @@ package middleware
 import (
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -25,10 +26,20 @@ func Logger(next http.Handler) http.Handler {
 
 		slog.Info("http",
 			"method", r.Method,
-			"path", r.URL.Path,
+			"path", logPath(r),
 			"status", rw.status,
 			"duration_ms", time.Since(start).Milliseconds(),
 			"request_id", IDFromContext(r.Context()),
 		)
 	})
+}
+
+func logPath(r *http.Request) string {
+	if r.Pattern == "" {
+		return "<unmatched>"
+	}
+	if _, pattern, ok := strings.Cut(r.Pattern, " "); ok {
+		return pattern
+	}
+	return r.Pattern
 }

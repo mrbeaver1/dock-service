@@ -11,9 +11,6 @@ import (
 	"github.com/mrbeaver1/dock-service/internal/config"
 )
 
-// NewClient creates a client for the HTTP endpoint configured in Docker Compose
-// and checks the bucket provisioned by s3-init. It does not create the bucket.
-// The cleanup function must be called after all S3 operations have finished.
 func NewClient(ctx context.Context, cfg config.S3Config) (*minio.Client, func(), error) {
 	transport, err := minio.DefaultTransport(false)
 	if err != nil {

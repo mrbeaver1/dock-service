@@ -2,7 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"os"
 	"os/signal"
 	"syscall"
 
@@ -10,25 +12,20 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		slog.Error("application failed", "error", err)
+		os.Exit(1)
+	}
+}
+
+func run() (err error) {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	app, err := app.New(ctx)
-
-	defer func() {
-		if app != nil {
-			err := app.Close()
-
-			if err != nil {
-				slog.Error(err.Error())
-			}
-			return
-		}
-	}()
-
+	application, err := app.New(ctx)
 	if err != nil {
-		slog.Error(err.Error())
-		return
+		return err
 	}
-
+	defer func() { err = errors.Join(err, application.Close()) }()
+	return application.Run(ctx)
 }

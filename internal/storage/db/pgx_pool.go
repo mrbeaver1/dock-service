@@ -33,7 +33,6 @@ func parseConfig(cfg config.PostgresConfig) (*pgxpool.Config, error) {
 	if sslMode == "" {
 		sslMode = "prefer"
 	}
-	// URL encoding preserves special characters in credentials and database names.
 	dsn := url.URL{
 		Scheme: "postgres",
 		User:   url.UserPassword(cfg.User, cfg.Password),

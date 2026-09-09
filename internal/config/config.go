@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/joho/godotenv"
 )
@@ -12,6 +13,8 @@ import (
 type Config struct {
 	HTTPPort   uint16
 	AdminToken string
+	JWTSecret  string
+	CacheTTL   time.Duration
 	RPS        uint64
 	Burst      uint64
 	Postgres   PostgresConfig
@@ -43,9 +46,6 @@ type S3Config struct {
 	Bucket      string
 }
 
-// Load reads a local .env file when it exists, then validates the effective
-// environment. Existing environment variables take precedence over .env,
-// which keeps Docker, CI, and production configuration authoritative.
 func Load() (Config, error) {
 	if err := loadDotEnv(); err != nil {
 		return Config{}, err
@@ -60,6 +60,14 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
+	jwtSecret, err := requiredEnv("JWT_SECRET")
+	if err != nil {
+		return Config{}, err
+	}
+	cacheTTL, err := time.ParseDuration(envOrDefault("CACHE_TTL", "5m"))
+	if err != nil || cacheTTL < time.Millisecond {
+		return Config{}, fmt.Errorf("CACHE_TTL must be a duration of at least one millisecond")
+	}
 
 	rps, err := requiredUint64("RPS")
 	if err != nil {
@@ -71,27 +79,7 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
-	postgresHost, err := requiredEnv("POSTGRES_HOST")
-	if err != nil {
-		return Config{}, err
-	}
-
-	postgresPort, err := requiredPort("POSTGRES_PORT")
-	if err != nil {
-		return Config{}, err
-	}
-
-	postgresUser, err := requiredEnv("POSTGRES_USER")
-	if err != nil {
-		return Config{}, err
-	}
-
-	postgresPassword, err := requiredEnv("POSTGRES_PASSWORD")
-	if err != nil {
-		return Config{}, err
-	}
-
-	postgresDatabase, err := requiredEnv("POSTGRES_DB")
+	postgres, err := postgresFromEnv()
 	if err != nil {
 		return Config{}, err
 	}
@@ -144,16 +132,11 @@ func Load() (Config, error) {
 	return Config{
 		HTTPPort:   httpPort,
 		AdminToken: adminToken,
+		JWTSecret:  jwtSecret,
+		CacheTTL:   cacheTTL,
 		RPS:        rps,
 		Burst:      burst,
-		Postgres: PostgresConfig{
-			Host:     postgresHost,
-			Port:     postgresPort,
-			User:     postgresUser,
-			Password: postgresPassword,
-			Database: postgresDatabase,
-			SSLMode:  envOrDefault("POSTGRES_SSL_MODE", "prefer"),
-		},
+		Postgres:   postgres,
 		Redis: RedisConfig{
 			Host:     redisHost,
 			Port:     redisPort,
@@ -168,6 +151,35 @@ func Load() (Config, error) {
 			Bucket:      s3Bucket,
 		},
 	}, nil
+}
+
+func LoadPostgres() (PostgresConfig, error) {
+	if err := loadDotEnv(); err != nil {
+		return PostgresConfig{}, err
+	}
+	return postgresFromEnv()
+}
+
+func postgresFromEnv() (PostgresConfig, error) {
+	var cfg PostgresConfig
+	var err error
+	if cfg.Host, err = requiredEnv("POSTGRES_HOST"); err != nil {
+		return cfg, err
+	}
+	if cfg.Port, err = requiredPort("POSTGRES_PORT"); err != nil {
+		return cfg, err
+	}
+	if cfg.User, err = requiredEnv("POSTGRES_USER"); err != nil {
+		return cfg, err
+	}
+	if cfg.Password, err = requiredEnv("POSTGRES_PASSWORD"); err != nil {
+		return cfg, err
+	}
+	if cfg.Database, err = requiredEnv("POSTGRES_DB"); err != nil {
+		return cfg, err
+	}
+	cfg.SSLMode = envOrDefault("POSTGRES_SSL_MODE", "prefer")
+	return cfg, nil
 }
 
 func loadDotEnv() error {

@@ -3,15 +3,20 @@ package api
 import (
 	"context"
 	"errors"
+
+	"io"
 	"log/slog"
 	"net/http"
-	"os"
+	"strconv"
 
+	"github.com/google/uuid"
 	"github.com/mrbeaver1/dock-service/internal/api/decoder"
 	"github.com/mrbeaver1/dock-service/internal/api/dto"
 	"github.com/mrbeaver1/dock-service/internal/api/middleware"
 	"github.com/mrbeaver1/dock-service/internal/api/response"
 	"github.com/mrbeaver1/dock-service/internal/api/validator"
+	"github.com/mrbeaver1/dock-service/internal/models"
+	"github.com/mrbeaver1/dock-service/internal/service"
 )
 
 type Handler interface {
@@ -23,33 +28,57 @@ type DocumentService interface {
 	GetDocumentsList(ctx context.Context, request dto.GetDocumentsRequest, ownerId string) (dto.GetDocumentsResult, error)
 }
 
+type DocumentReader interface {
+	GetDocument(context.Context, uuid.UUID, uuid.UUID, bool) (service.DocumentContent, error)
+}
+
 type UploadDocumentRequestValidator interface {
 	Validate(dto dto.CreateDocumentRequest) error
 }
 
 type handler struct {
+	documentReader                 DocumentReader
+	userService                    UserService
+	authSecret                     []byte
+	adminToken                     string
 	documentService                DocumentService
 	uploadDocumentRequestValidator UploadDocumentRequestValidator
 	rateLimiter                    *middleware.IPLimiter
 }
 
+func NewHandler(documents DocumentReader, users UserService, limiter *middleware.IPLimiter, secret []byte, adminToken string) Handler {
+	return &handler{documentReader: documents, userService: users, rateLimiter: limiter, authSecret: secret,
+		adminToken:                     adminToken,
+		uploadDocumentRequestValidator: validator.NewCreateDocumentRequestValidator()}
+}
+
 func (h *handler) Routes() http.Handler {
 	mux := http.NewServeMux()
+	mux.Handle("POST /api/register", middleware.AdminAuth(h.adminToken, decoder.FormToken)(http.HandlerFunc(h.register)))
+	mux.HandleFunc("POST /api/auth", h.authenticate)
+	mux.Handle("DELETE /api/auth/{token}", middleware.Auth(h.authSecret, decoder.PathToken)(http.HandlerFunc(notImplemented)))
 
-	mux.HandleFunc(
+	mux.Handle(
 		"GET /api/docs",
-		h.getDocuments,
+		middleware.Auth(h.authSecret, decoder.QueryToken)(http.HandlerFunc(h.getDocuments)),
 	)
 
-	mux.HandleFunc("POST /api/docs", h.uploadDocument)
+	mux.Handle("POST /api/docs", middleware.Auth(h.authSecret, decoder.MultipartToken)(http.HandlerFunc(h.uploadDocument)))
+	mux.Handle("DELETE /api/docs/{id}", middleware.Auth(h.authSecret, decoder.QueryToken)(http.HandlerFunc(notImplemented)))
 
-	mux.HandleFunc(
+	mux.Handle(
 		"GET /api/docs/{id}",
-		h.getDocument,
+		middleware.Auth(h.authSecret, decoder.QueryToken)(http.HandlerFunc(h.getDocument)),
 	)
 
-	mux.HandleFunc("/api/docs", methodNotAllowed)
-	mux.HandleFunc("/api/docs/{id}", methodNotAllowed)
+	mux.HandleFunc("/api/docs", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Allow", "GET, HEAD, POST")
+		response.Fail(w, r, 405, 405, "method not allowed")
+	})
+	mux.HandleFunc("/api/docs/{id}", methodNotAllowed("GET, HEAD, DELETE"))
+	mux.HandleFunc("/api/register", methodNotAllowed("POST"))
+	mux.HandleFunc("/api/auth", methodNotAllowed("POST"))
+	mux.HandleFunc("/api/auth/{token}", methodNotAllowed("DELETE"))
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		response.Fail(w, r, http.StatusNotFound, http.StatusNotFound, http.StatusText(http.StatusNotFound))
 	})
@@ -64,6 +93,10 @@ func (h *handler) Routes() http.Handler {
 }
 
 func (h *handler) getDocuments(w http.ResponseWriter, r *http.Request) {
+	if h.documentService == nil {
+		response.Fail(w, r, 501, 501, "not implemented")
+		return
+	}
 	reqDto, err := decoder.GetListRequestToDto(r)
 
 	if err != nil {
@@ -73,7 +106,7 @@ func (h *handler) getDocuments(w http.ResponseWriter, r *http.Request) {
 
 	ownerId := middleware.UserIDFromContext(r.Context())
 
-	resp, err := h.documentService.GetDocumentsList(r.Context(), reqDto, ownerId.(string))
+	resp, err := h.documentService.GetDocumentsList(r.Context(), reqDto, ownerId.String())
 
 	if err != nil {
 		writeDocumentError(w, r, err)
@@ -84,31 +117,19 @@ func (h *handler) getDocuments(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) uploadDocument(w http.ResponseWriter, r *http.Request) {
-	defer func() {
-		if r.MultipartForm != nil {
-			if err := r.MultipartForm.RemoveAll(); err != nil {
-				slog.ErrorContext(r.Context(), "remove multipart files", "error", err)
-			}
-		}
-	}()
-
-	err := r.ParseMultipartForm(0)
-
-	if err != nil {
-		slog.ErrorContext(r.Context(), "parse multipart form", "error", err)
-		writeMultipartError(w, r, err)
+	if h.documentService == nil {
+		response.Fail(w, r, 501, 501, "not implemented")
 		return
 	}
-
 	reqDto, closeFile, err := decoder.UploadRequestToDto(r)
 
-	defer func() {
-		err := closeFile()
-
-		if err != nil {
-			slog.ErrorContext(r.Context(), "close file", "error", err)
-		}
-	}()
+	if closeFile != nil {
+		defer func() {
+			if err := closeFile(); err != nil {
+				slog.ErrorContext(r.Context(), "close file", "error", err)
+			}
+		}()
+	}
 
 	if err != nil {
 		slog.ErrorContext(r.Context(), "upload request", "error", err)
@@ -124,7 +145,7 @@ func (h *handler) uploadDocument(w http.ResponseWriter, r *http.Request) {
 
 	ownerId := middleware.UserIDFromContext(r.Context())
 
-	resp, err := h.documentService.UploadDocument(r.Context(), reqDto, ownerId.(string))
+	resp, err := h.documentService.UploadDocument(r.Context(), reqDto, ownerId.String())
 
 	if err != nil {
 		writeDocumentError(w, r, err)
@@ -135,18 +156,70 @@ func (h *handler) uploadDocument(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *handler) getDocument(w http.ResponseWriter, r *http.Request) {
-	response.Fail(w, r, http.StatusNotImplemented, http.StatusNotImplemented, http.StatusText(http.StatusNotImplemented))
+	id, err := decoder.DocumentID(r)
+	if err != nil {
+		writeDocumentError(w, r, err)
+		return
+	}
+	result, err := h.documentReader.GetDocument(r.Context(), id, middleware.UserIDFromContext(r.Context()), r.Method == http.MethodHead)
+	if err != nil {
+		writeDocumentError(w, r, err)
+		return
+	}
+	if result.File == nil {
+		response.Success(w, r, nil, result.JSON)
+		return
+	}
+	file := result.File
+	if file.Content != nil {
+		defer func() {
+			if err := file.Content.Close(); err != nil {
+				slog.ErrorContext(r.Context(), "close document stream", "document_id", id, "error", err)
+			}
+		}()
+	}
+	if file.Size < 0 || (r.Method != http.MethodHead && file.Content == nil) {
+		writeInternalError(w, r, errors.New("invalid file result"))
+		return
+	}
+	w.Header().Set("Content-Type", file.MIME)
+	w.Header().Set("Content-Length", strconv.FormatInt(file.Size, 10))
+	w.Header().Set("Content-Disposition", "attachment")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(http.StatusOK)
+	if r.Method == http.MethodHead {
+		return
+	}
+	n, err := io.Copy(w, file.Content)
+	if err != nil || n != file.Size {
+		slog.ErrorContext(r.Context(), "stream document", "document_id", id, "bytes", n, "expected", file.Size, "error", err)
+		panic(http.ErrAbortHandler)
+	}
 }
 
-func methodNotAllowed(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Allow", "GET, HEAD")
-	response.Fail(w, r, http.StatusMethodNotAllowed, http.StatusMethodNotAllowed, http.StatusText(http.StatusMethodNotAllowed))
+func methodNotAllowed(allow string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Allow", allow)
+		response.Fail(w, r, 405, 405, "method not allowed")
+	}
+}
+
+func notImplemented(w http.ResponseWriter, r *http.Request) {
+	response.Fail(w, r, 501, 501, "not implemented")
 }
 
 func writeDocumentError(w http.ResponseWriter, r *http.Request, err error) {
+	if errors.Is(err, models.ErrDocumentNotFound) {
+		response.Fail(w, r, 404, 404, "document not found")
+		return
+	}
+	if errors.Is(err, service.ErrForbidden) {
+		response.Fail(w, r, 403, 403, "document access denied")
+		return
+	}
 	var decodeErr *decoder.DecodeError
 	if errors.As(err, &decodeErr) {
-		response.Fail(w, r, 400, 400, decodeErr.Field+": must be a JSON object with valid field types")
+		response.Fail(w, r, 400, 400, decodeErr.Error())
 		return
 	}
 	var fieldErr *validator.FieldError
@@ -157,16 +230,7 @@ func writeDocumentError(w http.ResponseWriter, r *http.Request, err error) {
 	writeInternalError(w, r, err)
 }
 
-func writeMultipartError(w http.ResponseWriter, r *http.Request, err error) {
-	var pathErr *os.PathError
-	if errors.As(err, &pathErr) {
-		writeInternalError(w, r, err)
-		return
-	}
-	response.Fail(w, r, 400, 400, "invalid multipart request")
-}
-
 func writeInternalError(w http.ResponseWriter, r *http.Request, err error) {
-	slog.ErrorContext(r.Context(), "create document failed", "error", err)
+	slog.ErrorContext(r.Context(), "document request failed", "error", err)
 	response.Fail(w, r, 500, 500, "internal server error")
 }

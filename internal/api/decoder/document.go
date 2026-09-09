@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/google/uuid"
 	"github.com/mrbeaver1/dock-service/internal/api/dto"
 )
 
@@ -16,6 +17,16 @@ type DecodeError struct {
 
 func (e *DecodeError) Error() string {
 	return fmt.Sprintf("decode %s: %v", e.Field, e.Err)
+}
+
+func (e *DecodeError) Unwrap() error { return e.Err }
+
+func DocumentID(r *http.Request) (uuid.UUID, error) {
+	id, err := uuid.Parse(r.PathValue("id"))
+	if err != nil {
+		return uuid.Nil, &DecodeError{Field: "id", Err: fmt.Errorf("must be a UUID: %w", err)}
+	}
+	return id, nil
 }
 
 func UploadRequestToDto(r *http.Request) (req dto.CreateDocumentRequest, closeFile func() error, err error) {

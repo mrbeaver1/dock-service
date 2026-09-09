@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"sync"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/minio/minio-go/v7"
+	"github.com/mrbeaver1/dock-service/internal/api"
+	"github.com/mrbeaver1/dock-service/internal/api/middleware"
 	"github.com/mrbeaver1/dock-service/internal/config"
 	"github.com/mrbeaver1/dock-service/internal/repository"
 	"github.com/mrbeaver1/dock-service/internal/service"
@@ -15,6 +18,7 @@ import (
 	"github.com/mrbeaver1/dock-service/internal/storage/db"
 	"github.com/mrbeaver1/dock-service/internal/storage/s3"
 	goredis "github.com/redis/go-redis/v9"
+	"golang.org/x/time/rate"
 )
 
 type diContainer struct {
@@ -24,10 +28,29 @@ type diContainer struct {
 	s3       *minio.Client
 	closeS3  func()
 
-	userService     service.UserService
-	userServiceOnce sync.Once
-	userRepo        service.UserRepository
-	userRepoOnce    sync.Once
+	userService         service.UserService
+	userServiceOnce     sync.Once
+	userServiceErr      error
+	passwordHasher      service.PasswordHasher
+	passwordHasherOnce  sync.Once
+	tokenIssuer         service.TokenIssuer
+	tokenIssuerOnce     sync.Once
+	tokenIssuerErr      error
+	userRepo            service.UserRepository
+	userRepoOnce        sync.Once
+	documentRepo        service.DocumentRepository
+	documentRepoOnce    sync.Once
+	documentService     service.DocumentService
+	documentServiceOnce sync.Once
+	documentServiceErr  error
+	cacheService        service.Cache
+	cacheServiceOnce    sync.Once
+	cacheServiceErr     error
+	s3Service           service.S3
+	s3ServiceOnce       sync.Once
+	handler             http.Handler
+	handlerOnce         sync.Once
+	handlerErr          error
 
 	closeOnce sync.Once
 	closeErr  error
@@ -64,12 +87,27 @@ func newDiContainer(ctx context.Context) (_ *diContainer, err error) {
 	return d, nil
 }
 
-func (d *diContainer) UserService() service.UserService {
+func (d *diContainer) UserService() (service.UserService, error) {
 	d.userServiceOnce.Do(func() {
-		d.userService = service.NewUserService(d.UserRepository())
+		tokens, err := d.TokenIssuer()
+		if err != nil {
+			d.userServiceErr = err
+			return
+		}
+		d.userService = service.NewUserService(d.UserRepository(), d.PasswordHasher(), tokens)
 	})
 
-	return d.userService
+	return d.userService, d.userServiceErr
+}
+
+func (d *diContainer) PasswordHasher() service.PasswordHasher {
+	d.passwordHasherOnce.Do(func() { d.passwordHasher = service.NewPasswordHasher() })
+	return d.passwordHasher
+}
+
+func (d *diContainer) TokenIssuer() (service.TokenIssuer, error) {
+	d.tokenIssuerOnce.Do(func() { d.tokenIssuer, d.tokenIssuerErr = service.NewJWTIssuer([]byte(d.cnf.JWTSecret)) })
+	return d.tokenIssuer, d.tokenIssuerErr
 }
 
 func (d *diContainer) UserRepository() service.UserRepository {
@@ -82,6 +120,51 @@ func (d *diContainer) UserRepository() service.UserRepository {
 
 func (d *diContainer) Cnf() config.Config {
 	return d.cnf
+}
+
+func (d *diContainer) DocumentRepository() service.DocumentRepository {
+	d.documentRepoOnce.Do(func() { d.documentRepo = repository.NewDocumentRepository(d.postgres) })
+	return d.documentRepo
+}
+
+func (d *diContainer) CacheService() (service.Cache, error) {
+	d.cacheServiceOnce.Do(func() { d.cacheService, d.cacheServiceErr = service.NewCache(d.redis, d.cnf.CacheTTL) })
+	return d.cacheService, d.cacheServiceErr
+}
+
+func (d *diContainer) S3Service() service.S3 {
+	d.s3ServiceOnce.Do(func() { d.s3Service = service.NewS3(d.s3, d.cnf.S3.Bucket) })
+	return d.s3Service
+}
+
+func (d *diContainer) DocumentService() (service.DocumentService, error) {
+	d.documentServiceOnce.Do(func() {
+		cache, err := d.CacheService()
+		if err != nil {
+			d.documentServiceErr = err
+			return
+		}
+		d.documentService = service.NewDocumentService(d.DocumentRepository(), d.S3Service(), cache)
+	})
+	return d.documentService, d.documentServiceErr
+}
+
+func (d *diContainer) Handler() (http.Handler, error) {
+	d.handlerOnce.Do(func() {
+		documents, err := d.DocumentService()
+		if err != nil {
+			d.handlerErr = err
+			return
+		}
+		users, err := d.UserService()
+		if err != nil {
+			d.handlerErr = err
+			return
+		}
+		limiter := middleware.NewIPLimiter(rate.Limit(d.cnf.RPS), int(d.cnf.Burst))
+		d.handler = api.NewHandler(documents, users, limiter, []byte(d.cnf.JWTSecret), d.cnf.AdminToken).Routes()
+	})
+	return d.handler, d.handlerErr
 }
 
 func (d *diContainer) Postgres() *pgxpool.Pool {

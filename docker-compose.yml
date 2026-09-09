@@ -8,6 +8,8 @@ services:
     environment:
       APP_PORT: ${APP_PORT}
       ADMIN_TOKEN: ${ADMIN_TOKEN}
+      JWT_SECRET: ${JWT_SECRET}
+      CACHE_TTL: ${CACHE_TTL:-5m}
       RPS: ${RPS}
       BURST: ${BURST}
       POSTGRES_HOST: postgres
